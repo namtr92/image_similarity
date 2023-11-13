@@ -3,7 +3,8 @@ import numpy as np
 import sys
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import models, transforms,datasets
+from torch.utils.data import Dataset,DataLoader
 from PIL import Image
 from tqdm import tqdm  # Import tqdm for the progress bar
 from PyQt5.QtWidgets import QApplication,QListWidgetItem,QAction, QWidget, \
@@ -16,7 +17,32 @@ from qt_material import apply_stylesheet
 image_extensions = ['.jpeg', '.png', '.jpg', '.bmp']
 def get_image_list(dir):   
     return [file for file in os.listdir(dir) if os.path.splitext(file)[1].lower() in image_extensions]
+preprocess = transforms.Compose([
+        transforms.Resize((512, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+class CustomImageDataset(Dataset):
+    def __init__(self, root_dir, cache_data = {},transform=None):
+        self.root_dir = root_dir
+        self.cache_data = cache_data
+        self.transform = transform
+        self.image_list = get_image_list(root_dir)
 
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        if self.image_list[idx] not in self.cache_data:
+            img_name = os.path.join(self.root_dir, self.image_list[idx])
+            image = Image.open(img_name).convert('RGB')
+
+            if self.transform:
+                image = self.transform(image)
+
+            return {'image': image, 'name': self.image_list[idx],'type':0}
+        else:
+            return {'image': self.cache_data[self.image_list[idx]], 'name': self.image_list[idx],'type':1}
 # Load pre-trained ResNet model
 model = models.resnet18(pretrained=True)
 model = nn.Sequential(*list(model.children())[:-1])  # Remove the last fully connected layer
@@ -26,11 +52,7 @@ model.to('cuda')
 # Preprocess input images
 def preprocess_image(image_path):
     image = Image.open(image_path).convert('RGB')
-    preprocess = transforms.Compose([
-        transforms.Resize((512, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    
     image = preprocess(image)
     image = image.unsqueeze(0)  # Add batch dimension
     return image
@@ -58,6 +80,15 @@ class SimilarityCalculator(QThread):
         self.reference_path = reference_path
         self.search_folder_path = search_folder_path
     def run(self):
+        cache_path = '.cache'
+        if(not os.path.isdir(cache_path)):
+            os.mkdir(cache_path)
+        cache_file_path = os.path.join(cache_path,'data.npz')
+        if (os.path.exists(cache_file_path)):
+            cache_data = np.load(cache_file_path)
+        else:
+            cache_data = {}
+        
         # Path to the folder containing all images
         image_folder_path = self.search_folder_path
 
@@ -70,15 +101,30 @@ class SimilarityCalculator(QThread):
         # Calculate similarity for all images in the folder
         image_similarity_list = []
         count = 0
-        images = get_image_list(image_folder_path)
-        total  = len(images)
-        for image_name in tqdm(images,desc="Calculating Similarity"):
-            image_path = os.path.join(image_folder_path, image_name)
-            image_features = get_image_features(image_path)
-            similarity_score = cosine_similarity(reference_features, image_features)
-            image_similarity_list.append((image_path, similarity_score))
-            self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
-            count = count+1
+        dataset = CustomImageDataset(root_dir=image_folder_path,cache_data=dict(cache_data), transform=preprocess)
+        data_loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2)
+        #images = get_image_list(image_folder_path)
+        total  = len(dataset)
+        with torch.no_grad():
+            for batch_idx, batch in tqdm(enumerate(data_loader),desc="Calculating Similarity"):
+                image = batch['image'][0]
+                image_name = batch['name'][0]
+                cache_type = batch['type'][0]
+                image_path = os.path.join(image_folder_path, image_name)
+                if (cache_type == 0):  
+                    features = model(image.unsqueeze(0).to('cuda')).cpu()
+                    image_features = features.squeeze().numpy()
+                    cache_data[image_name] = image_features                    
+                    similarity_score = cosine_similarity(reference_features, image_features)
+                    image_similarity_list.append((image_path, similarity_score))
+                    self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
+                    count = count+1
+                else:
+                    similarity_score = cosine_similarity(reference_features, image)
+                    image_similarity_list.append((image_path, similarity_score))
+                    self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
+                    count = count+1
+        np.savez(cache_file_path, **cache_data)
         sorted_images = sorted(image_similarity_list, key=lambda x: x[1], reverse=True)
         # Sort images based on similarity in descending order
         # # Print the sorted list
@@ -179,10 +225,13 @@ class ImageSimilarityApp(QWidget):
         self.setGeometry(300, 300, 500, 400)
         self.image_window = None
     def display_selected_image(self):
-        item = self.list_widget.selectedItems()[0]
-        image_path = item.data(Qt.UserRole)
-        if image_path:
-            self.display_image(image_path)
+        try:
+            item = self.list_widget.selectedItems()[0]
+            image_path = item.data(Qt.UserRole)
+            if image_path:
+                self.display_image(image_path)
+        except:
+            pass
     def display_image(self, image_path):
         if(not self.image_window):
             self.image_window = ImageWindow(image_path)
