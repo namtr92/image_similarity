@@ -13,14 +13,15 @@ from PyQt5.QtWidgets import QApplication,QListWidgetItem,QAction, QWidget, \
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from qt_material import apply_stylesheet
+import onnxruntime as ort
+import cv2
 
 image_extensions = ['.jpeg', '.png', '.jpg', '.bmp']
 def get_image_list(dir):   
     return [file for file in os.listdir(dir) if os.path.splitext(file)[1].lower() in image_extensions]
 preprocess = transforms.Compose([
-        transforms.Resize((512, 256)),
+        transforms.Resize((640, 640)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 class CustomImageDataset(Dataset):
     def __init__(self, root_dir, cache_data = {},transform=None):
@@ -40,15 +41,23 @@ class CustomImageDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
 
-            return {'image': image, 'name': self.image_list[idx],'type':0}
+            return {'image_process': image, 'name': self.image_list[idx],'type':0}
         else:
-            return {'image': self.cache_data[self.image_list[idx]], 'name': self.image_list[idx],'type':1}
+            return {'image_process': self.cache_data[self.image_list[idx]], 'name': self.image_list[idx],'type':1}
 # Load pre-trained ResNet model
 model = models.resnet18(pretrained=True)
 model = nn.Sequential(*list(model.children())[:-1])  # Remove the last fully connected layer
 model.eval()  # Set the model to evaluation mode
 model.to('cuda')
 
+providers = ['CUDAExecutionProvider','CPUExecutionProvider']
+options = ort.SessionOptions()
+options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+detection_model_path = 'model/model.onnx'
+# if not os.path.exists(detection_model_path):
+ONNXSession = ort.InferenceSession(detection_model_path,options=options,providers=providers)
+input_name = ONNXSession.get_inputs()[0].name
+output_name = ONNXSession.get_outputs()[0].name
 # Preprocess input images
 def preprocess_image(image_path):
     image = Image.open(image_path).convert('RGB')
@@ -60,8 +69,21 @@ def preprocess_image(image_path):
 # Calculate image features
 def get_image_features(image_path):
     input_image = preprocess_image(image_path)
+    segmentation_result = ONNXSession.run([output_name], {input_name: np.asarray(input_image)})[0][0]
+    _,product_mask = cv2.threshold(segmentation_result[0],0.5,255,cv2.THRESH_BINARY)
+    product_mask = product_mask.astype(np.uint8)
+    contours, _ = cv2.findContours(product_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c = max(contours, key = cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(c)
+    x = x*2
+    y =y*2
+    w = w*2
+    h = h*2
+    crop_img = input_image[:,:,y:y+h, x:x+w]
+    crop_img = transforms.Resize((256,256))(crop_img)
+    #crop_img = cv2.resize(crop_img,(256,256))
     with torch.no_grad():
-        features = model(input_image.to('cuda')).cpu()
+        features = model(crop_img.to('cuda')).cpu()
     return features.squeeze().numpy()
 
 # Function to calculate cosine similarity
@@ -85,7 +107,7 @@ class SimilarityCalculator(QThread):
             os.mkdir(cache_path)
         cache_file_path = os.path.join(cache_path,'data.npz')
         if (os.path.exists(cache_file_path)):
-            cache_data = np.load(cache_file_path)
+            cache_data = dict(np.load(cache_file_path))
         else:
             cache_data = {}
         
@@ -107,12 +129,24 @@ class SimilarityCalculator(QThread):
         total  = len(dataset)
         with torch.no_grad():
             for batch_idx, batch in tqdm(enumerate(data_loader),desc="Calculating Similarity"):
-                image = batch['image'][0]
+                image = batch['image_process']
                 image_name = batch['name'][0]
                 cache_type = batch['type'][0]
                 image_path = os.path.join(image_folder_path, image_name)
-                if (cache_type == 0):  
-                    features = model(image.unsqueeze(0).to('cuda')).cpu()
+                if (cache_type == 0):
+                    segmentation_result = ONNXSession.run([output_name], {input_name: np.asarray(image)})[0][0]
+                    _,product_mask = cv2.threshold(segmentation_result[0],0.5,255,cv2.THRESH_BINARY)
+                    product_mask = product_mask.astype(np.uint8)
+                    contours, _ = cv2.findContours(product_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    c = max(contours, key = cv2.contourArea)
+                    x,y,w,h = cv2.boundingRect(c)
+                    x = x*2
+                    y =y*2
+                    w = w*2
+                    h = h*2
+                    crop_img = image[:,:,y:y+h, x:x+w]
+                    crop_img = transforms.Resize((256,256))(crop_img)
+                    features = model(crop_img.to('cuda')).cpu()
                     image_features = features.squeeze().numpy()
                     cache_data[image_name] = image_features                    
                     similarity_score = cosine_similarity(reference_features, image_features)
@@ -120,7 +154,7 @@ class SimilarityCalculator(QThread):
                     self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
                     count = count+1
                 else:
-                    similarity_score = cosine_similarity(reference_features, image)
+                    similarity_score = cosine_similarity(reference_features, image[0])
                     image_similarity_list.append((image_path, similarity_score))
                     self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
                     count = count+1
