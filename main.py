@@ -75,12 +75,14 @@ def get_image_features(image_path):
     contours, _ = cv2.findContours(product_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     c = max(contours, key = cv2.contourArea)
     x,y,w,h = cv2.boundingRect(c)
-    x = x*2
-    y =y*2
-    w = w*2
-    h = h*2
+    x = x*2+150
+    y =y*2+100
+    w = 230
+    h =256
     crop_img = input_image[:,:,y:y+h, x:x+w]
     crop_img = transforms.Resize((256,256))(crop_img)
+    # test_img= transforms.ToPILImage()(crop_img[0])
+    # test_img.save('test.png')
     #crop_img = cv2.resize(crop_img,(256,256))
     with torch.no_grad():
         features = model(crop_img.to('cuda')).cpu()
@@ -138,26 +140,26 @@ class SimilarityCalculator(QThread):
                     _,product_mask = cv2.threshold(segmentation_result[0],0.5,255,cv2.THRESH_BINARY)
                     product_mask = product_mask.astype(np.uint8)
                     contours, _ = cv2.findContours(product_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    c = max(contours, key = cv2.contourArea)
-                    x,y,w,h = cv2.boundingRect(c)
-                    x = x*2
-                    y =y*2
-                    w = w*2
-                    h = h*2
-                    crop_img = image[:,:,y:y+h, x:x+w]
-                    crop_img = transforms.Resize((256,256))(crop_img)
-                    features = model(crop_img.to('cuda')).cpu()
-                    image_features = features.squeeze().numpy()
-                    cache_data[image_name] = image_features                    
-                    similarity_score = cosine_similarity(reference_features, image_features)
-                    image_similarity_list.append((image_path, similarity_score))
-                    self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
-                    count = count+1
+                    if (len(contours)>0):
+                        c = max(contours, key = cv2.contourArea)
+                        x,y,w,h = cv2.boundingRect(c)
+                        x = x*2+150
+                        y =y*2+100
+                        w = 230
+                        h =256
+                        crop_img = image[:,:,y:y+h, x:x+w]
+                        crop_img = transforms.Resize((256,256))(crop_img)
+                        features = model(crop_img.to('cuda')).cpu()
+                        image_features = features.squeeze().numpy()
+                        cache_data[image_name] = image_features                    
+                        similarity_score = cosine_similarity(reference_features, image_features)
+                        image_similarity_list.append((image_path, similarity_score))
+                        self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")                        
                 else:
                     similarity_score = cosine_similarity(reference_features, image[0])
                     image_similarity_list.append((image_path, similarity_score))
                     self.update_progress.emit(count*100/total, f"Calculating {count}/{total}")
-                    count = count+1
+                count = count+1
         np.savez(cache_file_path, **cache_data)
         sorted_images = sorted(image_similarity_list, key=lambda x: x[1], reverse=True)
         # Sort images based on similarity in descending order
@@ -324,7 +326,7 @@ class ImageSimilarityApp(QWidget):
             item.setData(Qt.UserRole, image_path)  # Store image path as item data
             self.list_widget.addItem(item)
 if __name__ == "__main__":
-    
+    #reference_features = get_image_features(r'E:\img_fuji\images\06-50-58-893.png')
     app = QApplication(sys.argv)
     apply_stylesheet(app, theme='light_blue.xml')
     ex = ImageSimilarityApp()
